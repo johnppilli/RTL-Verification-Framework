@@ -1,0 +1,12 @@
+# Build artifacts
+sim/obj_dir/
+sim/obj_dir_fifo/
+zig_src/*.o
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store

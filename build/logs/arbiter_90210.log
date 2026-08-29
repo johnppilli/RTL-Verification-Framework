@@ -1,0 +1,25 @@
+=== arbiter === seed 90210
+[ RUN  ] idle_grants_nothing
+[  OK  ] idle_grants_nothing (57 checks)
+[ RUN  ] single_requester_always_wins
+[  OK  ] single_requester_always_wins (121 checks)
+[ RUN  ] rotates_under_full_load
+[  OK  ] rotates_under_full_load (157 checks)
+[ RUN  ] no_starvation_under_contention
+[  OK  ] no_starvation_under_contention (14141 checks)
+[ RUN  ] random_stress
+[  OK  ] random_stress (11941 checks)
+
+-- arbiter coverage: 9/9 bins, 100.0% --
+   no requests              HIT  (264)
+   single request           HIT  (900)
+   all requesting           HIT  (1092)
+   contention               HIT  (2881)
+   worst-case wait reached  HIT  (480)
+   granted=0                HIT  (1103)
+   granted=1                HIT  (877)
+   granted=2                HIT  (914)
+   granted=3                HIT  (887)
+
+=== arbiter: 5 passed, 0 failed | 26417 checks, 0 errors | coverage 100.0% ===
+VLIB_RESULT suite=arbiter seed=90210 passed=5 failed=0 errors=0 coverage=100.0

@@ -1,0 +1,27 @@
+=== skid_buffer === seed 90210
+[ RUN  ] reset_clears_handshake
+[  OK  ] reset_clears_handshake (17 checks)
+[ RUN  ] single_beat_latency
+[  OK  ] single_beat_latency (55 checks)
+[ RUN  ] full_throughput
+[  OK  ] full_throughput (267 checks)
+[ RUN  ] backpressure_preserves_beats
+[  OK  ] backpressure_preserves_beats (93 checks)
+[ RUN  ] intermittent_ready
+[  OK  ] intermittent_ready (913 checks)
+[ RUN  ] random_handshake
+[  OK  ] random_handshake (7686 checks)
+
+-- skid_buffer coverage: 9/9 bins, 100.0% --
+   upstream stalled (valid, !ready)    HIT  (569)
+   downstream stalled (valid, !ready)  HIT  (821)
+   skid slot occupied                  HIT  (696)
+   empty                               HIT  (229)
+   back-to-back transfer               HIT  (642)
+   input only                          HIT  (607)
+   output only                         HIT  (607)
+   fully idle                          HIT  (67)
+   s_valid x m_ready                   HIT  (1129)
+
+=== skid_buffer: 6 passed, 0 failed | 9031 checks, 0 errors | coverage 100.0% ===
+VLIB_RESULT suite=skid_buffer seed=90210 passed=6 failed=0 errors=0 coverage=100.0

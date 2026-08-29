@@ -84,6 +84,10 @@ public:
         return false;
     }
 
+    // Drops outstanding items without flagging them. Used after a reset, which
+    // legitimately discards whatever was in flight.
+    void clear() { q_.clear(); }
+
     size_t outstanding() const { return q_.size(); }
     size_t matched() const { return matched_; }
     size_t errors() const { return errors_; }

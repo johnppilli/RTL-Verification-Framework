@@ -1,0 +1,22 @@
+=== counter === seed 7
+[ RUN  ] reset_clears_count
+[  OK  ] reset_clears_count (16 checks)
+[ RUN  ] counts_when_enabled
+[  OK  ] counts_when_enabled (66 checks)
+[ RUN  ] enable_gates_counting
+[  OK  ] enable_gates_counting (40 checks)
+[ RUN  ] wraps_at_max
+[  OK  ] wraps_at_max (262 checks)
+[ RUN  ] random_enable
+[  OK  ] random_enable (2002 checks)
+
+-- counter coverage: 6/6 bins, 100.0% --
+   count==0            HIT  (31)
+   count==255          HIT  (8)
+   enable low          HIT  (668)
+   enable high         HIT  (1677)
+   wrap 255->0         HIT  (6)
+   reset during count  HIT  (1)
+
+=== counter: 5 passed, 0 failed | 2386 checks, 0 errors | coverage 100.0% ===
+VLIB_RESULT suite=counter seed=7 passed=5 failed=0 errors=0 coverage=100.0

@@ -1,538 +1,290 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <queue>
+// FIFO testbench.
+//
+// Two independent checks run on every test. The cycle-by-cycle comparison
+// against the Zig model catches wrong flags and wrong counts; the scoreboard
+// catches the thing a per-cycle comparison cannot see, which is data coming out
+// in the wrong order or not coming out at all.
+
 #include "Vfifo.h"
-#include "verilated.h"
+#include "vlib/vlib.h"
 
-// Zig reference model functions
 extern "C" {
-    void fifo_init();
-    void fifo_tick();
-    void fifo_set_reset(bool rst_n);
-    void fifo_set_wr_en(bool wr_en);
-    void fifo_set_rd_en(bool rd_en);
-    void fifo_set_data_in(unsigned char data);
-    unsigned char fifo_get_data_out();
-    bool fifo_get_full();
-    bool fifo_get_empty();
-    size_t fifo_get_count();
+void fifo_init();
+void fifo_tick();
+void fifo_set_reset(bool rst_n);
+void fifo_set_wr_en(bool wr_en);
+void fifo_set_rd_en(bool rd_en);
+void fifo_set_data_in(unsigned char data);
+unsigned char fifo_get_data_out();
+bool fifo_get_full();
+bool fifo_get_empty();
+size_t fifo_get_count();
+size_t fifo_depth();
 }
 
-// =============================================================================
-// Latency Checker - Tracks write-to-read latency for data through the FIFO
-// =============================================================================
-class LatencyChecker {
-private:
-    struct Transaction {
-        unsigned char data;
-        int write_cycle;
-    };
-    std::queue<Transaction> pending;
-    int total_transactions;
-    int total_latency;
-    int min_latency;
-    int max_latency;
-    int latency_violations;
-    int max_allowed_latency;
+namespace {
 
+constexpr int kDepth = 8;
+
+class FifoEnv {
 public:
-    LatencyChecker(int max_latency_cycles) :
-        total_transactions(0),
-        total_latency(0),
-        min_latency(999999),
-        max_latency(0),
-        latency_violations(0),
-        max_allowed_latency(max_latency_cycles) {}
-
-    void record_write(unsigned char data, int cycle) {
-        Transaction t = {data, cycle};
-        pending.push(t);
+    explicit FifoEnv(vlib::TestContext& ctx, uint64_t max_latency = 0)
+        : ctx_(ctx), sb_("fifo data", max_latency) {
+        fifo_init();
+        tb_.open_trace(ctx.wave_path());
+        tb_.on_reset([](bool rst_n) { fifo_set_reset(rst_n); });
+        tb_.on_posedge([] { fifo_tick(); });
+        tb_.on_cycle_end([this] { compare(); });
+        drive(false, 0, false);
+        tb_.reset(3);
+        ctx_.check.eq(tb_.cycle(), "depth (model vs RTL parameter)", fifo_depth(), kDepth);
     }
 
-    bool check_read(unsigned char data, int cycle) {
-        if (pending.empty()) {
-            printf("  [LATENCY ERROR] Read with no pending write!\n");
-            return false;
+    // One cycle with the given stimulus. Returns the value read, if any.
+    //
+    // data_out is combinational off the read pointer, so the beat a read
+    // consumes is the one visible before the edge, not after it.
+    void step(bool wr_en, uint8_t data, bool rd_en) {
+        drive(wr_en, data, rd_en);
+
+        const bool full = tb_.dut()->full;
+        const bool empty = tb_.dut()->empty;
+        const bool will_write = wr_en && !full;
+        const bool will_read = rd_en && !empty;
+        const uint8_t head = tb_.dut()->data_out;
+
+        sample_coverage(wr_en, rd_en, full, empty);
+        tb_.tick();
+
+        // Both are stamped after the edge, so latency reads as the number of
+        // cycles the beat actually sat in the FIFO.
+        if (will_write) sb_.expect(data, tb_.cycle());
+        if (will_read) {
+            sb_.observe(head, tb_.cycle());
+            last_read_ = head;
         }
-
-        Transaction t = pending.front();
-        pending.pop();
-
-        if (t.data != data) {
-            printf("  [LATENCY ERROR] Data mismatch: expected %d, got %d\n", t.data, data);
-            return false;
-        }
-
-        int latency = cycle - t.write_cycle;
-        total_transactions++;
-        total_latency += latency;
-
-        if (latency < min_latency) min_latency = latency;
-        if (latency > max_latency) max_latency = latency;
-
-        if (latency > max_allowed_latency) {
-            printf("  [LATENCY VIOLATION] Data %d took %d cycles (max: %d)\n",
-                   data, latency, max_allowed_latency);
-            latency_violations++;
-            return false;
-        }
-
-        return true;
+        if (will_write) writes_++;
+        if (will_read) reads_++;
     }
 
-    void print_report() {
-        printf("\n========== Latency Report ==========\n");
-        printf("Total transactions: %d\n", total_transactions);
-        if (total_transactions > 0) {
-            printf("Min latency: %d cycles\n", min_latency);
-            printf("Max latency: %d cycles\n", max_latency);
-            printf("Avg latency: %.2f cycles\n", (float)total_latency / total_transactions);
-        }
-        printf("Latency violations: %d\n", latency_violations);
-        printf("Max allowed latency: %d cycles\n", max_allowed_latency);
+    void write(uint8_t d) { step(true, d, false); }
+    void read() { step(false, 0, true); }
+    void idle(int n = 1) { for (int i = 0; i < n; i++) step(false, 0, false); }
+
+    void finish() {
+        if (!sb_.drained()) ctx_.check.report(tb_.cycle(), "scoreboard did not drain");
+        ctx_.check.check(sb_.errors() == 0, tb_.cycle(), "scoreboard reported %zu error(s)",
+                         sb_.errors());
+        if (ctx_.verbose()) sb_.report();
     }
 
-    int get_violations() { return latency_violations; }
-};
+    Vfifo* dut() { return tb_.dut(); }
+    uint64_t cycle() const { return tb_.cycle(); }
+    uint8_t last_read() const { return last_read_; }
+    size_t writes() const { return writes_; }
+    size_t reads() const { return reads_; }
+    vlib::Scoreboard<uint8_t>& sb() { return sb_; }
+    // Reset discards whatever was in flight, so the scoreboard is dropped too.
+    void reset(int n = 3) {
+        tb_.reset(n);
+        sb_.clear();
+    }
 
-// =============================================================================
-// Functional Coverage Tracker
-// =============================================================================
-class CoverageTracker {
 private:
-    bool seen_empty;
-    bool seen_full;
-    bool seen_write_when_full;
-    bool seen_read_when_empty;
-    bool seen_simultaneous_rw;
-    bool seen_rollover;
-    int  count_bins[9];  // 0-8 for depth=8
-
-public:
-    CoverageTracker() :
-        seen_empty(false), seen_full(false),
-        seen_write_when_full(false), seen_read_when_empty(false),
-        seen_simultaneous_rw(false), seen_rollover(false) {
-        for (int i = 0; i < 9; i++) count_bins[i] = 0;
-    }
-
-    void sample(bool empty, bool full, int count, bool wr_en, bool rd_en) {
-        if (empty) seen_empty = true;
-        if (full) seen_full = true;
-        if (wr_en && full) seen_write_when_full = true;
-        if (rd_en && empty) seen_read_when_empty = true;
-        if (wr_en && rd_en) seen_simultaneous_rw = true;
-        if (count >= 0 && count <= 8) count_bins[count]++;
-    }
-
-    void record_rollover() { seen_rollover = true; }
-
-    void print_report() {
-        printf("\n========== Coverage Report ==========\n");
-        printf("Empty state:           %s\n", seen_empty ? "HIT" : "MISS");
-        printf("Full state:            %s\n", seen_full ? "HIT" : "MISS");
-        printf("Write when full:       %s\n", seen_write_when_full ? "HIT" : "MISS");
-        printf("Read when empty:       %s\n", seen_read_when_empty ? "HIT" : "MISS");
-        printf("Simultaneous R/W:      %s\n", seen_simultaneous_rw ? "HIT" : "MISS");
-        printf("Pointer rollover:      %s\n", seen_rollover ? "HIT" : "MISS");
-        printf("\nCount distribution:\n");
-        for (int i = 0; i <= 8; i++) {
-            printf("  count=%d: %d samples\n", i, count_bins[i]);
-        }
-
-        int hits = (seen_empty ? 1 : 0) + (seen_full ? 1 : 0) +
-                   (seen_write_when_full ? 1 : 0) + (seen_read_when_empty ? 1 : 0) +
-                   (seen_simultaneous_rw ? 1 : 0) + (seen_rollover ? 1 : 0);
-        printf("\nCoverage: %d/6 bins hit (%.1f%%)\n", hits, hits * 100.0 / 6);
-    }
-
-    int get_coverage_percent() {
-        int hits = (seen_empty ? 1 : 0) + (seen_full ? 1 : 0) +
-                   (seen_write_when_full ? 1 : 0) + (seen_read_when_empty ? 1 : 0) +
-                   (seen_simultaneous_rw ? 1 : 0) + (seen_rollover ? 1 : 0);
-        return hits * 100 / 6;
-    }
-};
-
-// =============================================================================
-// Clock cycle helper
-// =============================================================================
-void tick(Vfifo* dut, int& cycle) {
-    dut->clk = 1;
-    dut->eval();
-    fifo_tick();
-    dut->clk = 0;
-    dut->eval();
-    cycle++;
-}
-
-// =============================================================================
-// Compare RTL vs Reference Model
-// =============================================================================
-int compare_outputs(Vfifo* dut, int cycle) {
-    int errors = 0;
-
-    unsigned char rtl_data_out = dut->data_out;
-    unsigned char ref_data_out = fifo_get_data_out();
-    bool rtl_full = dut->full;
-    bool ref_full = fifo_get_full();
-    bool rtl_empty = dut->empty;
-    bool ref_empty = fifo_get_empty();
-    int rtl_count = dut->count;
-    size_t ref_count = fifo_get_count();
-
-    if (rtl_full != ref_full) {
-        printf("  [MISMATCH] Cycle %d: full - RTL=%d, REF=%d\n", cycle, rtl_full, ref_full);
-        errors++;
-    }
-    if (rtl_empty != ref_empty) {
-        printf("  [MISMATCH] Cycle %d: empty - RTL=%d, REF=%d\n", cycle, rtl_empty, ref_empty);
-        errors++;
-    }
-    if (rtl_count != (int)ref_count) {
-        printf("  [MISMATCH] Cycle %d: count - RTL=%d, REF=%zu\n", cycle, rtl_count, ref_count);
-        errors++;
-    }
-    // Only compare data_out when not empty
-    if (!rtl_empty && rtl_data_out != ref_data_out) {
-        printf("  [MISMATCH] Cycle %d: data_out - RTL=%d, REF=%d\n", cycle, rtl_data_out, ref_data_out);
-        errors++;
-    }
-
-    return errors;
-}
-
-// =============================================================================
-// Main Testbench
-// =============================================================================
-int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    srand(time(NULL));
-
-    Vfifo* dut = new Vfifo;
-    fifo_init();
-
-    LatencyChecker latency(20);  // Max 20 cycles latency allowed
-    CoverageTracker coverage;
-
-    int cycle = 0;
-    int total_errors = 0;
-    int writes_completed = 0;
-    int reads_completed = 0;
-
-    printf("==============================================\n");
-    printf("  FIFO Verification with Latency Checking\n");
-    printf("==============================================\n\n");
-
-    // -------------------------------------------------------------------------
-    // Reset Sequence
-    // -------------------------------------------------------------------------
-    printf("[TEST] Reset sequence...\n");
-    dut->clk = 0;
-    dut->rst_n = 0;
-    dut->wr_en = 0;
-    dut->rd_en = 0;
-    dut->data_in = 0;
-    dut->eval();
-
-    fifo_set_reset(false);
-    fifo_set_wr_en(false);
-    fifo_set_rd_en(false);
-    fifo_set_data_in(0);
-
-    for (int i = 0; i < 5; i++) {
-        tick(dut, cycle);
-    }
-
-    // Release reset
-    dut->rst_n = 1;
-    fifo_set_reset(true);
-    dut->eval();
-
-    total_errors += compare_outputs(dut, cycle);
-    printf("  Reset complete. FIFO should be empty.\n");
-    printf("  RTL: empty=%d, full=%d, count=%d\n", dut->empty, dut->full, dut->count);
-
-    // -------------------------------------------------------------------------
-    // Test 1: Basic Write/Read
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Basic write/read sequence...\n");
-
-    // Write 4 items
-    for (int i = 0; i < 4; i++) {
-        unsigned char data = i + 1;
-        dut->wr_en = 1;
-        dut->data_in = data;
-        fifo_set_wr_en(true);
+    void drive(bool wr_en, uint8_t data, bool rd_en) {
+        tb_->wr_en = wr_en;
+        tb_->rd_en = rd_en;
+        tb_->data_in = data;
+        fifo_set_wr_en(wr_en);
+        fifo_set_rd_en(rd_en);
         fifo_set_data_in(data);
-
-        tick(dut, cycle);
-        latency.record_write(data, cycle);
-        writes_completed++;
-
-        dut->wr_en = 0;
-        fifo_set_wr_en(false);
-
-        total_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, true, false);
-        printf("  Write %d: count=%d\n", data, dut->count);
+        tb_.eval();
     }
 
-    // Read 4 items
-    for (int i = 0; i < 4; i++) {
-        dut->rd_en = 1;
-        fifo_set_rd_en(true);
-
-        unsigned char data_before_read = dut->data_out;
-        tick(dut, cycle);
-        latency.check_read(data_before_read, cycle);
-        reads_completed++;
-
-        dut->rd_en = 0;
-        fifo_set_rd_en(false);
-
-        total_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, false, true);
-        printf("  Read %d: count=%d\n", data_before_read, dut->count);
+    void sample_coverage(bool wr_en, bool rd_en, bool full, bool empty) {
+        vlib::CoverGroup& c = ctx_.cov;
+        c.cover("empty", empty);
+        c.cover("full", full);
+        c.cover("write while full", wr_en && full);
+        c.cover("read while empty", rd_en && empty);
+        c.cover("simultaneous r/w", wr_en && rd_en);
+        c.cover("idle", !wr_en && !rd_en);
+        c.cover_value("count", tb_.dut()->count);
+        if (wr_ptr_wrapped()) c.cover("write pointer wrap");
+        if (rd_ptr_wrapped()) c.cover("read pointer wrap");
     }
 
-    // -------------------------------------------------------------------------
-    // Test 2: Fill to Full
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Fill FIFO to full...\n");
+    // The pointers are internal, so wrap is inferred from the observable
+    // sequence: DEPTH accepted writes (or reads) since the last wrap.
+    bool wr_ptr_wrapped() {
+        if (!(tb_->wr_en && !tb_.dut()->full)) return false;
+        return (++wr_beats_ % kDepth) == 0;
+    }
+    bool rd_ptr_wrapped() {
+        if (!(tb_->rd_en && !tb_.dut()->empty)) return false;
+        return (++rd_beats_ % kDepth) == 0;
+    }
+
+    void compare() {
+        Vfifo* d = tb_.dut();
+        ctx_.check.eq(tb_.cycle(), "full", d->full, fifo_get_full());
+        ctx_.check.eq(tb_.cycle(), "empty", d->empty, fifo_get_empty());
+        ctx_.check.eq(tb_.cycle(), "count", d->count, fifo_get_count());
+        // data_out is undefined while empty; the RTL exposes stale memory.
+        if (!d->empty)
+            ctx_.check.eq(tb_.cycle(), "data_out", d->data_out, fifo_get_data_out());
+    }
+
+    vlib::TestContext& ctx_;
+    vlib::TestBench<Vfifo> tb_;
+    vlib::Scoreboard<uint8_t> sb_;
+    uint8_t last_read_ = 0;
+    size_t writes_ = 0, reads_ = 0;
+    size_t wr_beats_ = 0, rd_beats_ = 0;
+};
+
+void declare_bins(vlib::CoverGroup& cov) {
+    cov.bins({"empty", "full", "write while full", "read while empty",
+              "simultaneous r/w", "idle", "write pointer wrap", "read pointer wrap"});
+    cov.value_bins("count", 0, kDepth);
+}
+
+}  // namespace
+
+VLIB_TEST(reset_empties_fifo, "reset clears the count and both flags settle") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    ctx.check.eq(env.cycle(), "empty after reset", env.dut()->empty, 1);
+    ctx.check.eq(env.cycle(), "full after reset", env.dut()->full, 0);
+    ctx.check.eq(env.cycle(), "count after reset", env.dut()->count, 0);
+
+    // Reset from a partially filled FIFO, not just from power-on.
+    for (int i = 0; i < 5; i++) env.write(0xA0 + i);
+    ctx.check.eq(env.cycle(), "count before reset", env.dut()->count, 5);
+    env.reset(2);
+    ctx.check.eq(env.cycle(), "count after mid-run reset", env.dut()->count, 0);
+    ctx.check.eq(env.cycle(), "empty after mid-run reset", env.dut()->empty, 1);
+    env.finish();
+}
+
+VLIB_TEST(fill_then_drain, "fill to full, drain to empty, data comes back in order") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    for (int i = 0; i < kDepth; i++) {
+        env.write(0x10 + i);
+        ctx.check.eq(env.cycle(), "count while filling", env.dut()->count, i + 1);
+    }
+    ctx.check.eq(env.cycle(), "full at depth", env.dut()->full, 1);
+
+    for (int i = 0; i < kDepth; i++) {
+        env.read();
+        ctx.check.eq(env.cycle(), "read value", env.last_read(), 0x10 + i);
+        ctx.check.eq(env.cycle(), "count while draining", env.dut()->count, kDepth - i - 1);
+    }
+    ctx.check.eq(env.cycle(), "empty after drain", env.dut()->empty, 1);
+    env.finish();
+}
+
+VLIB_TEST(overflow_is_ignored, "writing to a full FIFO changes nothing") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    for (int i = 0; i < kDepth; i++) env.write(i + 1);
+    ctx.check.eq(env.cycle(), "full", env.dut()->full, 1);
+
+    const uint8_t head = env.dut()->data_out;
+    for (int i = 0; i < 4; i++) env.write(0xFF);
+    ctx.check.eq(env.cycle(), "count after overflow attempts", env.dut()->count, kDepth);
+    ctx.check.eq(env.cycle(), "head unchanged by overflow", env.dut()->data_out, head);
+
+    // The rejected writes must not have entered the queue.
+    for (int i = 0; i < kDepth; i++) {
+        env.read();
+        ctx.check.eq(env.cycle(), "value survived overflow attempts", env.last_read(), i + 1);
+    }
+    env.finish();
+}
+
+VLIB_TEST(underflow_is_ignored, "reading an empty FIFO changes nothing") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    for (int i = 0; i < 5; i++) env.read();
+    ctx.check.eq(env.cycle(), "still empty", env.dut()->empty, 1);
+    ctx.check.eq(env.cycle(), "count still zero", env.dut()->count, 0);
+
+    env.write(0x42);
+    env.read();
+    ctx.check.eq(env.cycle(), "value after underflow attempts", env.last_read(), 0x42);
+    env.finish();
+}
+
+VLIB_TEST(simultaneous_read_write, "count holds steady when a read and write pair up") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    for (int i = 0; i < 4; i++) env.write(0x50 + i);
+    const int held = env.dut()->count;
 
     for (int i = 0; i < 8; i++) {
-        unsigned char data = 100 + i;
-        dut->wr_en = 1;
-        dut->data_in = data;
-        fifo_set_wr_en(true);
-        fifo_set_data_in(data);
-
-        tick(dut, cycle);
-        if (!dut->full) {
-            latency.record_write(data, cycle);
-            writes_completed++;
-        }
-
-        total_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, true, false);
+        env.step(true, 0x60 + i, true);
+        ctx.check.eq(env.cycle(), "count during paired r/w", env.dut()->count, held);
     }
 
-    dut->wr_en = 0;
-    fifo_set_wr_en(false);
-    printf("  FIFO full=%d, count=%d\n", dut->full, dut->count);
-
-    // Try to write when full
-    printf("\n[TEST] Write when full (should be ignored)...\n");
-    dut->wr_en = 1;
-    dut->data_in = 0xFF;
-    fifo_set_wr_en(true);
-    fifo_set_data_in(0xFF);
-    tick(dut, cycle);
-    coverage.sample(dut->empty, dut->full, dut->count, true, false);
-    total_errors += compare_outputs(dut, cycle);
-    printf("  After write attempt: count=%d (should still be 8)\n", dut->count);
-    dut->wr_en = 0;
-    fifo_set_wr_en(false);
-
-    // -------------------------------------------------------------------------
-    // Test 3: Drain to Empty
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Drain FIFO to empty...\n");
-
-    while (!dut->empty) {
-        dut->rd_en = 1;
-        fifo_set_rd_en(true);
-
-        unsigned char data_out = dut->data_out;
-        tick(dut, cycle);
-        latency.check_read(data_out, cycle);
-        reads_completed++;
-
-        total_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, false, true);
-    }
-
-    dut->rd_en = 0;
-    fifo_set_rd_en(false);
-    printf("  FIFO empty=%d, count=%d\n", dut->empty, dut->count);
-
-    // Try to read when empty
-    printf("\n[TEST] Read when empty (should be ignored)...\n");
-    dut->rd_en = 1;
-    fifo_set_rd_en(true);
-    tick(dut, cycle);
-    coverage.sample(dut->empty, dut->full, dut->count, false, true);
-    total_errors += compare_outputs(dut, cycle);
-    printf("  After read attempt: empty=%d (should still be 1)\n", dut->empty);
-    dut->rd_en = 0;
-    fifo_set_rd_en(false);
-
-    // -------------------------------------------------------------------------
-    // Test 4: Simultaneous Read/Write
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Simultaneous read/write...\n");
-
-    // First put some data in
-    for (int i = 0; i < 4; i++) {
-        unsigned char data = 50 + i;
-        dut->wr_en = 1;
-        dut->data_in = data;
-        fifo_set_wr_en(true);
-        fifo_set_data_in(data);
-        tick(dut, cycle);
-        latency.record_write(data, cycle);
-        writes_completed++;
-        total_errors += compare_outputs(dut, cycle);
-    }
-    dut->wr_en = 0;
-    fifo_set_wr_en(false);
-
-    // Now do simultaneous R/W
-    printf("  Before: count=%d\n", dut->count);
-    for (int i = 0; i < 4; i++) {
-        unsigned char new_data = 60 + i;
-        unsigned char read_data = dut->data_out;
-
-        dut->wr_en = 1;
-        dut->rd_en = 1;
-        dut->data_in = new_data;
-        fifo_set_wr_en(true);
-        fifo_set_rd_en(true);
-        fifo_set_data_in(new_data);
-
-        tick(dut, cycle);
-        latency.record_write(new_data, cycle);
-        latency.check_read(read_data, cycle);
-        writes_completed++;
-        reads_completed++;
-
-        total_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, true, true);
-        printf("  Simultaneous R/W: wrote %d, read %d, count=%d\n", new_data, read_data, dut->count);
-    }
-    dut->wr_en = 0;
-    dut->rd_en = 0;
-    fifo_set_wr_en(false);
-    fifo_set_rd_en(false);
-
-    // -------------------------------------------------------------------------
-    // Test 5: Randomized Stress Test
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Randomized stress test (100 cycles)...\n");
-
-    int rand_errors = 0;
-    for (int i = 0; i < 100; i++) {
-        bool do_write = (rand() % 2) && !dut->full;
-        bool do_read = (rand() % 2) && !dut->empty;
-        unsigned char data = rand() % 256;
-
-        unsigned char read_data = dut->data_out;
-
-        dut->wr_en = do_write;
-        dut->rd_en = do_read;
-        dut->data_in = data;
-        fifo_set_wr_en(do_write);
-        fifo_set_rd_en(do_read);
-        fifo_set_data_in(data);
-
-        tick(dut, cycle);
-
-        if (do_write) {
-            latency.record_write(data, cycle);
-            writes_completed++;
-        }
-        if (do_read) {
-            latency.check_read(read_data, cycle);
-            reads_completed++;
-        }
-
-        rand_errors += compare_outputs(dut, cycle);
-        coverage.sample(dut->empty, dut->full, dut->count, do_write, do_read);
-    }
-
-    dut->wr_en = 0;
-    dut->rd_en = 0;
-    fifo_set_wr_en(false);
-    fifo_set_rd_en(false);
-
-    total_errors += rand_errors;
-    printf("  Random test errors: %d\n", rand_errors);
-
-    // -------------------------------------------------------------------------
-    // Test 6: Pointer Rollover Test
-    // -------------------------------------------------------------------------
-    printf("\n[TEST] Pointer rollover test...\n");
-
-    // Drain any remaining data
-    while (!dut->empty) {
-        dut->rd_en = 1;
-        fifo_set_rd_en(true);
-        unsigned char d = dut->data_out;
-        tick(dut, cycle);
-        latency.check_read(d, cycle);
-        reads_completed++;
-    }
-    dut->rd_en = 0;
-    fifo_set_rd_en(false);
-
-    // Write and read 20 items to force pointer wraparound
-    for (int i = 0; i < 20; i++) {
-        unsigned char data = i;
-
-        // Write
-        dut->wr_en = 1;
-        dut->data_in = data;
-        fifo_set_wr_en(true);
-        fifo_set_data_in(data);
-        tick(dut, cycle);
-        latency.record_write(data, cycle);
-        writes_completed++;
-        dut->wr_en = 0;
-        fifo_set_wr_en(false);
-
-        // Read
-        dut->rd_en = 1;
-        fifo_set_rd_en(true);
-        unsigned char read_data = dut->data_out;
-        tick(dut, cycle);
-        latency.check_read(read_data, cycle);
-        reads_completed++;
-        dut->rd_en = 0;
-        fifo_set_rd_en(false);
-
-        total_errors += compare_outputs(dut, cycle);
-
-        if (read_data != data) {
-            printf("  [ERROR] Rollover mismatch: wrote %d, read %d\n", data, read_data);
-        }
-    }
-    coverage.record_rollover();
-    printf("  Pointer rollover test complete\n");
-
-    // -------------------------------------------------------------------------
-    // Final Reports
-    // -------------------------------------------------------------------------
-    printf("\n==============================================\n");
-    printf("           VERIFICATION COMPLETE\n");
-    printf("==============================================\n");
-    printf("\nTotal cycles: %d\n", cycle);
-    printf("Writes completed: %d\n", writes_completed);
-    printf("Reads completed: %d\n", reads_completed);
-    printf("RTL vs Reference mismatches: %d\n", total_errors);
-
-    latency.print_report();
-    coverage.print_report();
-
-    printf("\n========== Final Result ==========\n");
-    int latency_errors = latency.get_violations();
-    if (total_errors == 0 && latency_errors == 0) {
-        printf("PASSED - All tests passed!\n");
-    } else {
-        printf("FAILED - %d mismatches, %d latency violations\n", total_errors, latency_errors);
-    }
-
-    delete dut;
-    return (total_errors + latency_errors) > 0 ? 1 : 0;
+    while (!env.dut()->empty) env.read();
+    env.finish();
 }
+
+VLIB_TEST(single_entry_latency, "a lone beat is readable the cycle after it lands") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx, /*max_latency=*/1);
+
+    for (int i = 0; i < 6; i++) {
+        env.write(0x70 + i);
+        ctx.check.eq(env.cycle(), "not empty after write", env.dut()->empty, 0);
+        env.read();
+        ctx.check.eq(env.cycle(), "value", env.last_read(), 0x70 + i);
+        ctx.check.eq(env.cycle(), "empty again", env.dut()->empty, 1);
+    }
+    env.finish();
+}
+
+VLIB_TEST(pointer_rollover, "pointers wrap cleanly past the end of memory") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    // Three laps around an 8-entry memory at varying occupancy.
+    for (int lap = 0; lap < 3; lap++) {
+        for (int i = 0; i < kDepth; i++) env.write(lap * 16 + i);
+        for (int i = 0; i < kDepth; i++) {
+            env.read();
+            ctx.check.eq(env.cycle(), "value after wrap", env.last_read(), lap * 16 + i);
+        }
+    }
+    ctx.check.check(env.writes() == 3 * kDepth, env.cycle(), "expected %d writes, got %zu",
+                    3 * kDepth, env.writes());
+    env.finish();
+}
+
+VLIB_TEST(random_stress, "randomized traffic against the model and the scoreboard") {
+    declare_bins(ctx.cov);
+    FifoEnv env(ctx);
+
+    const uint64_t n = ctx.cfg.cycles;
+    for (uint64_t i = 0; i < n; i++) {
+        // Deliberately unconditional: wr_en while full and rd_en while empty are
+        // exactly the cases the DUT has to reject on its own.
+        const bool wr = ctx.rng.chance(55);
+        const bool rd = ctx.rng.chance(45);
+        env.step(wr, ctx.rng.u8(), rd);
+    }
+
+    while (!env.dut()->empty) env.read();
+    env.finish();
+    ctx.log("%zu writes, %zu reads over %llu cycles", env.writes(), env.reads(),
+            (unsigned long long)n);
+}
+
+VLIB_SUITE_MAIN("fifo")

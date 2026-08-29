@@ -1,0 +1,39 @@
+=== fifo === seed 7
+[ RUN  ] reset_empties_fifo
+[  OK  ] reset_empties_fifo (43 checks)
+[ RUN  ] fill_then_drain
+[  OK  ] fill_then_drain (100 checks)
+[ RUN  ] overflow_is_ignored
+[  OK  ] overflow_is_ignored (101 checks)
+[ RUN  ] underflow_is_ignored
+[  OK  ] underflow_is_ignored (36 checks)
+[ RUN  ] simultaneous_read_write
+[  OK  ] simultaneous_read_write (82 checks)
+[ RUN  ] single_entry_latency
+[  OK  ] single_entry_latency (71 checks)
+[ RUN  ] pointer_rollover
+[  OK  ] pointer_rollover (225 checks)
+[ RUN  ] random_stress
+[  OK  ] random_stress (8013 checks)
+
+-- fifo coverage: 17/17 bins, 100.0% --
+   empty               HIT  (33)
+   full                HIT  (376)
+   write while full    HIT  (206)
+   read while empty    HIT  (14)
+   simultaneous r/w    HIT  (509)
+   idle                HIT  (496)
+   write pointer wrap  HIT  (118)
+   read pointer wrap   HIT  (118)
+   count=0             HIT  (33)
+   count=1             HIT  (68)
+   count=2             HIT  (87)
+   count=3             HIT  (161)
+   count=4             HIT  (227)
+   count=5             HIT  (239)
+   count=6             HIT  (363)
+   count=7             HIT  (574)
+   count=8             HIT  (376)
+
+=== fifo: 8 passed, 0 failed | 8671 checks, 0 errors | coverage 100.0% ===
+VLIB_RESULT suite=fifo seed=7 passed=8 failed=0 errors=0 coverage=100.0

@@ -1,0 +1,36 @@
+=== alu === seed 7
+[ RUN  ] directed_arithmetic
+[  OK  ] directed_arithmetic (45 checks)
+[ RUN  ] directed_logic_and_shift
+[  OK  ] directed_logic_and_shift (54 checks)
+[ RUN  ] directed_comparison
+[  OK  ] directed_comparison (31 checks)
+[ RUN  ] corner_cross_product
+[  OK  ] corner_cross_product (11250 checks)
+[ RUN  ] undefined_opcodes
+[  OK  ] undefined_opcodes (42 checks)
+[ RUN  ] random_operands
+[  OK  ] random_operands (10000 checks)
+
+-- alu coverage: 18/18 bins, 100.0% --
+   op ADD                    HIT  (435)
+   op SUB                    HIT  (436)
+   op AND                    HIT  (437)
+   op OR                     HIT  (432)
+   op XOR                    HIT  (424)
+   op SLL                    HIT  (414)
+   op SRL                    HIT  (415)
+   op SRA                    HIT  (428)
+   op SLT                    HIT  (421)
+   op SLTU                   HIT  (428)
+   result zero               HIT  (903)
+   result negative           HIT  (1342)
+   carry set                 HIT  (365)
+   signed overflow           HIT  (186)
+   shift by zero             HIT  (181)
+   shift by 31               HIT  (228)
+   op ADD x signed overflow  HIT  (89)
+   op SUB x signed overflow  HIT  (97)
+
+=== alu: 6 passed, 0 failed | 21422 checks, 0 errors | coverage 100.0% ===
+VLIB_RESULT suite=alu seed=7 passed=6 failed=0 errors=0 coverage=100.0

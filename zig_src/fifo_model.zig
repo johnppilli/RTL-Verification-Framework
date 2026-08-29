@@ -1,96 +1,84 @@
-// Reference model for FIFO - the "golden" implementation
-// This is what the RTL should behave like
+// Reference model for rtl/fifo.sv. DEPTH and DATA_WIDTH must match the RTL
+// parameters; the testbench asserts this against the DUT at startup.
 
 const DEPTH: usize = 8;
-const DATA_WIDTH: usize = 8;
 
-const FifoState = struct {
+const State = struct {
     memory: [DEPTH]u8 = [_]u8{0} ** DEPTH,
     wr_ptr: usize = 0,
     rd_ptr: usize = 0,
     count: usize = 0,
 
-    // Input signals (set by testbench before tick)
+    rst_n: bool = false,
     wr_en: bool = false,
     rd_en: bool = false,
     data_in: u8 = 0,
-    rst_n: bool = false,
 };
 
-var state: FifoState = .{};
+var st: State = .{};
 
-// Called on every rising clock edge - mimics the RTL behavior
+export fn fifo_init() void {
+    st = .{};
+}
+
+export fn fifo_depth() usize {
+    return DEPTH;
+}
+
+export fn fifo_set_reset(rst_n: bool) void {
+    st.rst_n = rst_n;
+}
+
+export fn fifo_set_wr_en(wr_en: bool) void {
+    st.wr_en = wr_en;
+}
+
+export fn fifo_set_rd_en(rd_en: bool) void {
+    st.rd_en = rd_en;
+}
+
+export fn fifo_set_data_in(data: u8) void {
+    st.data_in = data;
+}
+
 export fn fifo_tick() void {
-    if (!state.rst_n) {
-        // Reset: clear pointers and count
-        state.wr_ptr = 0;
-        state.rd_ptr = 0;
-        state.count = 0;
-    } else {
-        const can_write = state.wr_en and (state.count < DEPTH);
-        const can_read = state.rd_en and (state.count > 0);
+    if (!st.rst_n) {
+        st.wr_ptr = 0;
+        st.rd_ptr = 0;
+        st.count = 0;
+        return;
+    }
 
-        // Write operation
-        if (can_write) {
-            state.memory[state.wr_ptr] = state.data_in;
-            state.wr_ptr = (state.wr_ptr + 1) % DEPTH;
-        }
+    const do_write = st.wr_en and st.count < DEPTH;
+    const do_read = st.rd_en and st.count > 0;
 
-        // Read operation (advances pointer)
-        if (can_read) {
-            state.rd_ptr = (state.rd_ptr + 1) % DEPTH;
-        }
+    if (do_write) {
+        st.memory[st.wr_ptr] = st.data_in;
+        st.wr_ptr = (st.wr_ptr + 1) % DEPTH;
+    }
+    if (do_read) {
+        st.rd_ptr = (st.rd_ptr + 1) % DEPTH;
+    }
 
-        // Update count
-        if (can_write and !can_read) {
-            state.count += 1;
-        } else if (can_read and !can_write) {
-            state.count -= 1;
-        }
+    if (do_write and !do_read) {
+        st.count += 1;
+    } else if (do_read and !do_write) {
+        st.count -= 1;
     }
 }
 
-// Set the reset signal
-export fn fifo_set_reset(rst_n: bool) void {
-    state.rst_n = rst_n;
-}
-
-// Set the write enable signal
-export fn fifo_set_wr_en(wr_en: bool) void {
-    state.wr_en = wr_en;
-}
-
-// Set the read enable signal
-export fn fifo_set_rd_en(rd_en: bool) void {
-    state.rd_en = rd_en;
-}
-
-// Set the data input
-export fn fifo_set_data_in(data: u8) void {
-    state.data_in = data;
-}
-
-// Get the data output (always shows head of queue)
 export fn fifo_get_data_out() u8 {
-    return state.memory[state.rd_ptr];
+    return st.memory[st.rd_ptr];
 }
 
-// Get the full flag
 export fn fifo_get_full() bool {
-    return state.count == DEPTH;
+    return st.count == DEPTH;
 }
 
-// Get the empty flag
 export fn fifo_get_empty() bool {
-    return state.count == 0;
+    return st.count == 0;
 }
 
-// Get the current count
 export fn fifo_get_count() usize {
-    return state.count;
-}
-
-// Reset the model to initial state (for starting new tests)
-export fn fifo_init() void {
-    state = .{};
+    return st.count;
 }

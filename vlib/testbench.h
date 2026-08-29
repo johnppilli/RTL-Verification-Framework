@@ -47,6 +47,7 @@ public:
 
     DUT* operator->() { return dut_; }
     DUT* dut() { return dut_; }
+    const DUT* dut() const { return dut_; }
     uint64_t cycle() const { return cycle_; }
 
     // Runs after the rising edge has propagated through the RTL. This is where
